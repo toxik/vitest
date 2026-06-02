@@ -2,11 +2,11 @@ import type { CoverageMap } from 'istanbul-lib-coverage'
 import type { ProxifiedModule } from 'magicast'
 import type { Profiler } from 'node:inspector'
 import type { CoverageProvider, ReportContext, TestProject, Vite, Vitest } from 'vitest/node'
+import type { RemapWorkerResult } from './worker'
 import { existsSync, promises as fs } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error -- untyped
 import { mergeProcessCovs } from '@bcoe/v8-coverage'
-import astV8ToIstanbul from 'ast-v8-to-istanbul'
 import libCoverage from 'istanbul-lib-coverage'
 import libReport from 'istanbul-lib-report'
 import reports from 'istanbul-reports'
@@ -14,9 +14,11 @@ import { parseModule } from 'magicast'
 import { createDebug } from 'obug'
 import { normalize } from 'pathe'
 import { provider } from 'std-env'
+import Tinypool from 'tinypool'
 import c from 'tinyrainbow'
-import { BaseCoverageProvider, parseAstAsync } from 'vitest/node'
+import { BaseCoverageProvider } from 'vitest/node'
 import { version } from '../package.json' with { type: 'json' }
+import { convertToIstanbul } from './to-istanbul'
 
 export interface ScriptCoverageWithOffset extends Profiler.ScriptCoverage {
   startOffset: number
@@ -29,11 +31,61 @@ interface RawCoverage { result: ScriptCoverageWithOffset[] }
 
 const FILE_PROTOCOL = 'file://'
 
+/**
+ * Below this number of files the worker pool is not worth its startup cost
+ * (spawning threads + loading the parser in each), so conversion stays inline
+ * on the main thread.
+ */
+const WORKER_POOL_FILE_THRESHOLD = 20
+
 const debug = createDebug('vitest:coverage')
 
 export class V8CoverageProvider extends BaseCoverageProvider implements CoverageProvider {
   name = 'v8' as const
   version: string = version
+
+  private pool: Tinypool | undefined
+
+  /**
+   * Lazily spin up a worker pool for the CPU-bound V8 -> Istanbul conversion.
+   * No-op when disabled, when concurrency is 1, when the file count is too low
+   * to amortize startup, or when a pool already exists.
+   */
+  private ensurePool(fileCount: number): void {
+    if (this.pool) {
+      return
+    }
+
+    const toggle = process.env.VITEST_COVERAGE_WORKER_POOL
+
+    if (toggle === 'false') {
+      return
+    }
+
+    const maxThreads = this.options.processingConcurrency
+
+    // `VITEST_COVERAGE_WORKER_POOL=true` forces the pool on regardless of file
+    // count (useful for benchmarking); otherwise honor the amortization threshold.
+    if (toggle !== 'true' && (maxThreads <= 1 || fileCount < WORKER_POOL_FILE_THRESHOLD)) {
+      return
+    }
+
+    this.pool = new Tinypool({
+      filename: fileURLToPath(new URL('./worker.js', import.meta.url)),
+      minThreads: 1,
+      maxThreads,
+    })
+
+    debug('Created coverage worker pool with %d threads', maxThreads)
+  }
+
+  private async destroyPool(): Promise<void> {
+    if (this.pool) {
+      const pool = this.pool
+      this.pool = undefined
+      await pool.destroy()
+    }
+  }
 
   initialize(ctx: Vitest): void {
     this._initialize(ctx)
@@ -68,80 +120,85 @@ export class V8CoverageProvider extends BaseCoverageProvider implements Coverage
 
     const autoAttachSubprocess = this.options.autoAttachSubprocess
 
-    await this.readCoverageFiles<RawCoverage>({
-      onFileRead(coverage) {
-        coverages.push(coverage)
+    try {
+      await this.readCoverageFiles<RawCoverage>({
+        onFileRead(coverage) {
+          coverages.push(coverage)
 
-        for (const result of coverage.result) {
-          if (result.startOffset && !startOffsets.has(result.url)) {
-            startOffsets.set(result.url, result.startOffset)
+          for (const result of coverage.result) {
+            if (result.startOffset && !startOffsets.has(result.url)) {
+              startOffsets.set(result.url, result.startOffset)
+            }
+
+            if (autoAttachSubprocess && result.isExtendedContext) {
+              extendedContexts.add(result.url)
+            }
+          }
+        },
+        onFinished: async (project, environment) => {
+          // Merge every process coverage in a single pass. `mergeProcessCovs` is
+          // associative, so folding it per-file (`[merged, next]`) is O(n^2) on
+          // large suites - merging the whole batch at once is O(n).
+          const merged: RawCoverage = coverages.length
+            ? mergeProcessCovs(coverages)
+            : { result: [] }
+
+          // Restore values dropped by the merge in one pass over the result.
+          for (const result of merged.result) {
+            if (!result.startOffset) {
+              result.startOffset = startOffsets.get(result.url) || 0
+            }
+
+            if (autoAttachSubprocess && !result.isExtendedContext && extendedContexts.has(result.url)) {
+              result.isExtendedContext = true
+            }
           }
 
-          if (autoAttachSubprocess && result.isExtendedContext) {
-            extendedContexts.add(result.url)
-          }
-        }
-      },
-      onFinished: async (project, environment) => {
-        // Merge every process coverage in a single pass. `mergeProcessCovs` is
-        // associative, so folding it per-file (`[merged, next]`) is O(n^2) on
-        // large suites - merging the whole batch at once is O(n).
-        const merged: RawCoverage = coverages.length
-          ? mergeProcessCovs(coverages)
-          : { result: [] }
+          // Source maps can change based on projectName and transform mode.
+          // Coverage transform re-uses source maps so we need to separate transforms from each other.
+          const converted = await this.convertCoverage(
+            merged,
+            project,
+            environment,
+          )
 
-        // Restore values dropped by the merge in one pass over the result.
-        for (const result of merged.result) {
-          if (!result.startOffset) {
-            result.startOffset = startOffsets.get(result.url) || 0
-          }
+          coverageMap.merge(converted)
 
-          if (autoAttachSubprocess && !result.isExtendedContext && extendedContexts.has(result.url)) {
-            result.isExtendedContext = true
-          }
-        }
+          coverages = []
+          startOffsets.clear()
+          extendedContexts.clear()
+        },
+        onDebug: debug,
+      })
 
-        // Source maps can change based on projectName and transform mode.
-        // Coverage transform re-uses source maps so we need to separate transforms from each other.
-        const converted = await this.convertCoverage(
-          merged,
-          project,
-          environment,
-        )
+      // Include untested files when all tests were run (not a single file re-run)
+      // or if previous results are preserved by "cleanOnRerun: false"
+      if (this.options.include != null && (allTestsRun || !this.options.cleanOnRerun)) {
+        const coveredFiles = coverageMap.files()
+        const untestedCoverage = await this.getCoverageMapForUncoveredFiles(coveredFiles)
 
-        coverageMap.merge(converted)
-
-        coverages = []
-        startOffsets.clear()
-        extendedContexts.clear()
-      },
-      onDebug: debug,
-    })
-
-    // Include untested files when all tests were run (not a single file re-run)
-    // or if previous results are preserved by "cleanOnRerun: false"
-    if (this.options.include != null && (allTestsRun || !this.options.cleanOnRerun)) {
-      const coveredFiles = coverageMap.files()
-      const untestedCoverage = await this.getCoverageMapForUncoveredFiles(coveredFiles)
-
-      coverageMap.merge(untestedCoverage)
-    }
-
-    coverageMap.filter((filename) => {
-      const exists = existsSync(filename)
-
-      if (this.options.excludeAfterRemap) {
-        return exists && this.isIncluded(filename)
+        coverageMap.merge(untestedCoverage)
       }
 
-      return exists
-    })
+      coverageMap.filter((filename) => {
+        const exists = existsSync(filename)
 
-    if (debug.enabled) {
-      debug(`Generate coverage total time ${(performance.now() - start!).toFixed()} ms`)
+        if (this.options.excludeAfterRemap) {
+          return exists && this.isIncluded(filename)
+        }
+
+        return exists
+      })
+
+      if (debug.enabled) {
+        debug(`Generate coverage total time ${(performance.now() - start!).toFixed()} ms`)
+      }
+
+      return coverageMap
     }
-
-    return coverageMap
+    finally {
+      await this.destroyPool()
+    }
   }
 
   async generateReports(coverageMap: CoverageMap, allTestsRun?: boolean): Promise<void> {
@@ -193,6 +250,8 @@ export class V8CoverageProvider extends BaseCoverageProvider implements Coverage
 
     const uncoveredFiles = await this.getUntestedFiles(testedFiles)
 
+    this.ensurePool(uncoveredFiles.length)
+
     let index = 0
 
     const coverageMap = this.createCoverageMap()
@@ -241,136 +300,34 @@ export class V8CoverageProvider extends BaseCoverageProvider implements Coverage
   }
 
   private async remapCoverage(filename: string, wrapperLength: number, result: Awaited<ReturnType<typeof this.getSources>>, functions: Profiler.FunctionCoverage[]) {
-    let ast
+    const payload = {
+      code: result.code,
+      map: result.map,
+      url: filename,
+      wrapperLength,
+      functions,
+      ignoreClassMethods: this.options.ignoreClassMethods,
+    }
 
     try {
-      ast = await parseAstAsync(result.code)
+      // Offload the CPU-bound parse + remap to the worker pool when available,
+      // otherwise run it inline on the main thread.
+      if (this.pool) {
+        const response: RemapWorkerResult = await this.pool.run(payload)
+
+        if (response.error) {
+          throw Object.assign(new Error(response.error.message), { stack: response.error.stack })
+        }
+
+        return response.data ?? {}
+      }
+
+      return await convertToIstanbul(payload)
     }
     catch (error) {
       this.ctx.logger.error(`Failed to parse ${filename}. Excluding it from coverage.\n`, error)
       return {}
     }
-
-    return await astV8ToIstanbul({
-      code: result.code,
-      sourceMap: result.map,
-      ast,
-      coverage: { functions, url: filename },
-      ignoreClassMethods: this.options.ignoreClassMethods,
-      wrapperLength,
-      ignoreNode: (node, type) => {
-        // SSR transformed imports
-        if (
-          type === 'statement'
-          && node.type === 'VariableDeclarator'
-          && node.id.type === 'Identifier'
-          && node.id.name.startsWith('__vite_ssr_import_')
-        ) {
-          return true
-        }
-
-        // SSR transformed exports vite@>6.3.5
-        if (
-          type === 'statement'
-          && node.type === 'ExpressionStatement'
-          && node.expression.type === 'AssignmentExpression'
-          && node.expression.left.type === 'MemberExpression'
-          && node.expression.left.object.type === 'Identifier'
-          && node.expression.left.object.name === '__vite_ssr_exports__'
-        ) {
-          return true
-        }
-
-        // SSR transformed exports vite@^6.3.5
-        if (
-          type === 'statement'
-          && node.type === 'VariableDeclarator'
-          && node.id.type === 'Identifier'
-          && node.id.name === '__vite_ssr_export_default__'
-        ) {
-          return true
-        }
-
-        // CJS imports as ternaries - e.g.
-        // const React = __vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react.default : __vite__cjsImport0_react;
-        if (
-          type === 'branch'
-          && node.type === 'ConditionalExpression'
-          && node.test.type === 'MemberExpression'
-          && node.test.object.type === 'Identifier'
-          && node.test.object.name.startsWith('__vite__cjsImport')
-          && node.test.property.type === 'Identifier'
-          && node.test.property.name === '__esModule'
-        ) {
-          return true
-        }
-
-        // in-source test with "if (import.meta.vitest)"
-        if (
-          (type === 'branch' || type === 'statement')
-          && node.type === 'IfStatement'
-          && node.test.type === 'MemberExpression'
-          && node.test.property.type === 'Identifier'
-          && node.test.property.name === 'vitest'
-        ) {
-          // SSR
-          if (
-            node.test.object.type === 'Identifier'
-            && node.test.object.name === '__vite_ssr_import_meta__'
-          ) {
-            return 'ignore-this-and-nested-nodes'
-          }
-
-          // Web
-          if (
-            node.test.object.type === 'MetaProperty'
-            && node.test.object.meta.name === 'import'
-            && node.test.object.property.name === 'meta'
-          ) {
-            return 'ignore-this-and-nested-nodes'
-          }
-        }
-
-        // Browser mode's "import.meta.env ="
-        if (
-          type === 'statement'
-          && node.type === 'ExpressionStatement'
-          && node.expression.type === 'AssignmentExpression'
-          && node.expression.left.type === 'MemberExpression'
-          && node.expression.left.object.type === 'MetaProperty'
-          && node.expression.left.object.meta.name === 'import'
-          && node.expression.left.object.property.name === 'meta'
-          && node.expression.left.property.type === 'Identifier'
-          && node.expression.left.property.name === 'env'
-        ) {
-          return true
-        }
-
-        // SSR mode's "import.meta.env ="
-        if (
-          type === 'statement'
-          && node.type === 'ExpressionStatement'
-          && node.expression.type === 'AssignmentExpression'
-          && node.expression.left.type === 'MemberExpression'
-          && node.expression.left.object.type === 'Identifier'
-          && node.expression.left.object.name === '__vite_ssr_import_meta__'
-        ) {
-          return true
-        }
-
-        // SWC's decorators
-        if (
-          type === 'statement'
-          && node.type === 'ExpressionStatement'
-          && node.expression.type === 'CallExpression'
-          && node.expression.callee.type === 'Identifier'
-          && node.expression.callee.name === '_ts_decorate'
-        ) {
-          return 'ignore-this-and-nested-nodes'
-        }
-      },
-    },
-    )
   }
 
   private async getSources(
@@ -457,6 +414,8 @@ export class V8CoverageProvider extends BaseCoverageProvider implements Coverage
         scriptCoverages.push({ ...result, url: decodeURIComponent(result.url) })
       }
     }
+
+    this.ensurePool(scriptCoverages.length)
 
     const coverageMap = this.createCoverageMap()
     let index = 0

@@ -723,6 +723,9 @@ importers:
       std-env:
         specifier: 'catalog:'
         version: 4.0.0-rc.1
+      tinypool:
+        specifier: ^1.1.1
+        version: 1.1.1
       tinyrainbow:
         specifier: 'catalog:'
         version: 3.1.0
@@ -9735,6 +9738,10 @@ packages:
     peerDependenciesMeta:
       picocolors:
         optional: true
+
+  tinypool@1.1.1:
+    resolution: {integrity: sha512-Zba82s87IFq9A9XmjiX5uZA/ARWDrB03OHlq+Vw1fSdt0I+4/Kutwy8BP4Y/y/aORMo61FQ0vIb5j44vSo5Pkg==}
+    engines: {node: ^18.0.0 || >=20.0.0}
 
   tinyrainbow@3.1.0:
     resolution: {integrity: sha512-Bf+ILmBgretUrdJxzXM0SgXLZ3XfiaUuOj/IKQHuTXip+05Xn+uyEYdVg0kYDipTBcLrCVyUzAPz7QmArb0mmw==}
@@ -19063,6 +19070,8 @@ snapshots:
       js-tokens: 8.0.2
     optionalDependencies:
       picocolors: 1.1.1
+
+  tinypool@1.1.1: {}
 
   tinyrainbow@3.1.0: {}
 

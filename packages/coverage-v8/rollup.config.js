@@ -13,6 +13,7 @@ const entries = {
   index: 'src/index.ts',
   browser: 'src/browser.ts',
   provider: 'src/provider.ts',
+  worker: 'src/worker.ts',
 }
 
 const external = [
